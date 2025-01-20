@@ -1,0 +1,358 @@
+<?php
+
+namespace WordPress\Git;
+
+use WordPress\ByteStream\MemoryPipe;
+use WordPress\Filesystem\InMemoryFilesystem;
+use WordPress\Git\Model\Commit;
+use WordPress\Git\Model\TreeEntry;
+use WordPress\Git\Protocol\Parser\GitProtocolReader;
+use WordPress\Git\Protocol\Writers\PacketWriter;
+use WordPress\Git\Protocol\Writers\PackWriter;
+use WordPress\HttpClient\Client;
+use WordPress\HttpClient\Request;
+
+use function WordPress\Filesystem\wp_parent_paths;
+use function WordPress\Filesystem\wp_path_segments;
+
+class GitRemote {
+	/**
+	 * @var Client
+	 */
+	private $http_client;
+	/**
+	 * @var GitRepository
+	 */
+	private $repository;
+	private $remote_name;
+
+	public function __construct( GitRepository $repository, $remote_name, $options = array() ) {
+		$this->remote_name = $remote_name;
+		$this->repository  = $repository;
+		$this->http_client = $options['http_client'] ?? new Client([
+            'timeout' => 300
+        ]);
+	}
+
+	public function ls_refs( $prefix='' ) {
+		$response = $this->http_request(
+			'/git-upload-pack',
+            PacketWriter::encode_packet_lines( [
+                "command=ls-refs\n",
+                "agent=git/2.37.3\n",
+                "object-format=sha1\n",
+                '0001',
+                "peel\n",
+                "ref-prefix $prefix\n",
+                '0000',
+            ] ),
+			array(
+				'Accept'       => 'application/x-git-upload-pack-advertisement',
+				'Content-Type' => 'application/x-git-upload-pack-request',
+				'Git-Protocol' => 'version=2',
+			)
+		);
+
+		$refs = array();
+        $protocol = new GitProtocolReader(['will_process_pack' => false]);
+        while($response->next_bytes()) {
+            $protocol->append_bytes($response->get_bytes());
+            while($protocol->next_token()) {
+                switch($protocol->get_token_type()) {
+                    case '#data':
+                        $ref_line = $protocol->get_packet_body();
+                        $ref = $this->parse_ref_line($ref_line);
+                        if(false === $ref) {
+                            continue 2;
+                        }
+                        $refs[$ref['ref_name']] = $ref['hash'];
+
+                        if ( str_starts_with( $ref['ref_name'], 'refs/heads/' ) ) {
+                            $branch_name = substr( $ref['ref_name'], strlen( 'refs/heads/' ) );
+                            $this->repository->set_ref_head('refs/remotes/' . $this->remote_name . '/' . $branch_name, $ref['hash']);
+                        }
+                        break;
+                }
+            }
+        }
+		return $refs;
+	}
+
+    private function parse_ref_line($ref_line) {
+        $space_pos = strpos( $ref_line, ' ' );
+        if ( $space_pos === false ) {
+            return false;
+        }
+        $hash       = substr( $ref_line, 0, $space_pos );
+        $ref_name   = substr( $ref_line, $space_pos + 1 );
+
+        // Check for peeled hash at end
+        if ( preg_match( '/^(.+) peeled:([a-f0-9]{40})$/', $ref_name, $matches ) ) {
+            $ref_name = $matches[1];
+            $hash = $matches[2];
+        }
+
+        return array(
+            'hash' => $hash,
+            'ref_name' => $ref_name
+        );
+    }
+
+	public function force_push_one_commit() {
+		$push_ref_name = $this->repository->get_ref_head( 'HEAD', array( 'follow_symrefs' => false ) );
+		$push_ref_name = $this->localize_ref_name( $push_ref_name );
+
+		$push_commit = $this->repository->get_ref_head( 'refs/heads/' . $push_ref_name );
+		$parent_hash = $this->repository->read_object( $push_commit )->as_commit()->get_first_parent_hash();
+
+		$remote_commit = $this->repository->get_ref_head( 'refs/remotes/' . $this->remote_name . '/' . $push_ref_name );
+		// @TODO: Do find_objects_added_since to enable pushing multiple commits at once.
+		//        OR! perhaps supporting "have" and "want" would solve this.
+		// $delta = $this->repository->find_objects_added_in($push_commit, $parent_hash);
+		$delta = $this->repository->find_objects_added_in( $push_commit, $remote_commit );
+
+		// @TODO: Implement PushReader that produces these bytes on demand
+        $pack_buffer = new MemoryPipe();
+        $pack_writer = new PackWriter($pack_buffer);
+
+        $packet_buffer = new MemoryPipe();
+        $packet_writer = new PacketWriter($packet_buffer);
+
+        $packet_writer->append_line("$remote_commit $push_commit refs/heads/$push_ref_name\0report-status force-update\n");
+        $packet_writer->append_line('0000');
+		foreach ( $delta as $oid ) {
+			$reader = $this->repository->read_object( $oid );
+            $pack_writer->append_object_header($reader->get_object_type_name(), $reader->get_uncompressed_size());
+            $pack_writer->append_bytes($reader->read_entire_object_contents());
+            $pack_writer->flush_object_body();
+        }
+        $pack_writer->append_checksum();
+        $pack_writer->close();
+        $packet_writer->append_line($pack_buffer->get_bytes());
+        $packet_writer->append_line('0000');
+
+        $push_packet = $packet_buffer->get_bytes();
+
+		$response = $this->http_request(
+			'/git-receive-pack',
+			$push_packet,
+			array(
+				'Content-Type' => 'application/x-git-receive-pack-request',
+				'Accept'       => 'application/x-git-receive-pack-result',
+			)
+		);
+
+        $data_packets = array();
+
+        $protocol = new GitProtocolReader(['will_process_pack' => false]);
+        while($response->next_bytes()) {
+            $protocol->append_bytes($response->get_bytes());
+            while($protocol->next_token()) {
+                switch($protocol->get_token_type()) {
+                    case '#data':
+                        $data_packets[] = $protocol->get_packet_body();
+                        break;
+                }
+            }
+        }
+
+        $expected_response = array(
+            'unpack ok',
+            'ok refs/heads/' . $push_ref_name,
+        );
+        if($data_packets != $expected_response) {
+            throw new GitException( 'Push failed:' . $response );
+        }
+
+		$this->repository->set_ref_head( 'refs/remotes/' . $this->remote_name . '/' . $push_ref_name, $push_commit );
+	}
+
+	private function localize_ref_name( $ref_name ) {
+		if ( str_starts_with( $ref_name, 'ref: ' ) ) {
+			$ref_name = trim( substr( $ref_name, 5 ) );
+		}
+		if ( str_starts_with( $ref_name, 'refs/heads/' ) ) {
+			return substr( $ref_name, strlen( 'refs/heads/' ) );
+		}
+
+		return $ref_name;
+	}
+
+	public function list_objects( $ref_hash, ): GitRepository {
+		$response = $this->request_objects_list($ref_hash);
+        $tmp_repo = new GitRepository(InMemoryFilesystem::create());
+        $tmp_repo->set_ref_head('HEAD', $ref_hash);
+        $protocol = new GitProtocolReader([
+            'write_to_repository' => $tmp_repo,
+            'resolve_deltas_from_repository' => $this->repository,
+        ]);
+        $protocol->consume_stream($response);
+        return $tmp_repo;
+	}
+
+    private function request_objects_list( $ref_hash ) {
+        return $this->http_request(
+            '/git-upload-pack',
+            PacketWriter::encode_packet_lines([
+                "want {$ref_hash} multi_ack_detailed no-done side-band thin-pack ofs-delta agent=git/2.37.3 filter\n",
+                "filter blob:none\n",
+                "shallow {$ref_hash}\n",
+                "deepen 1\n",
+                '0000',
+                "done\n",
+                "done\n",
+            ]),
+        );
+    }
+
+    public function fetch_branch( $options = [] ) {
+        $branch_name = $this->resolve_branch_name($options['branch'] ?? null);
+        try {
+            $last_fetched_head_ref = $this->repository->get_ref_head( 'refs/remotes/' . $this->remote_name . '/' . $branch_name );
+        } catch (GitException $e) {
+            $last_fetched_head_ref = Commit::NULL_HASH;
+        }
+
+        $remote_refs = $this->ls_refs( 'refs/heads/' . $branch_name );
+        $remote_head = $remote_refs[ 'refs/heads/' . $branch_name ];
+
+        if($last_fetched_head_ref === $remote_head) {
+            return $remote_head;
+        }
+
+        $shallow = $options['shallow'] ?? false;
+        $subpath = $options['path'] ?? false;
+        $want_oids = [];
+        $have_oids = [];
+        if($subpath) {
+            if(!$shallow) {
+                throw new GitException('When the "path" option is used, "shallow" option must also be true. Non-shallow path fetch is not supported yet.');
+            }
+
+            $response = $this->request_objects_list($remote_head);
+            $protocol = new GitProtocolReader([
+                'write_to_repository' => $this->repository,
+                'resolve_deltas_from_repository' => $this->repository,
+            ]);
+            $protocol->consume_stream($response);
+
+            $commit = $this->repository->read_object($remote_head)->as_commit();
+            $requested_tree_oid = $this->repository->find_hash_by_path($subpath, $commit->tree);
+            $descentant_blobs_oids = get_all_descendant_oids_in_tree($this->repository, $requested_tree_oid, [
+                'object_types' => [
+                    TreeEntry::FILE_MODE_REGULAR_EXECUTABLE,
+                    TreeEntry::FILE_MODE_REGULAR_NON_EXECUTABLE,
+                ],
+            ]);
+
+            foreach($descentant_blobs_oids as $oid) {
+                if(!$this->repository->has_object($oid)) {
+                    $want_oids[] = $oid;
+                }
+            }
+        } else {
+            $want_oids[] = $remote_head;
+            $have_oids[] = $last_fetched_head_ref;
+        }
+
+        if(count($want_oids) === 0) {
+            return $remote_head;
+        }
+
+        $this->fetch_specific_objects( $want_oids, $have_oids, $options );
+        $this->repository->set_ref_head( "refs/remotes/{$this->remote_name}/{$branch_name}", $remote_head );
+        return $remote_head;
+    }
+
+	public function force_pull( $options = [] ) {
+        $options['branch'] = $this->resolve_branch_name($options['branch'] ?? null);
+        $remote_head = $this->fetch_branch($options);
+        $this->repository->set_ref_head( "refs/heads/" . $options['branch'], $remote_head );
+        return $remote_head;
+	}
+
+    private function resolve_branch_name( $branch_name ) {
+        if(null !== $branch_name) {
+            return $branch_name;
+        }
+
+        // Return the default branch name
+        $branch_name = $this->repository->get_ref_head( 'HEAD', array( 'follow_symrefs' => false ) );
+        $branch_name = $this->localize_ref_name( $branch_name );
+        return $branch_name;
+    }
+
+	public function fetch_specific_objects( $want_refs, $have_refs = array(), $options = [] ) {
+        if ( empty( $want_refs ) ) {
+            return;
+        }
+
+        $packet_lines = array();
+        for($i = 0; $i < count($want_refs); $i++) {
+            $packet_line = "want {$want_refs[$i]}";
+            if($i === 0) {
+                $packet_line .= " multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=git/2.37.3";
+            }
+            $packet_line .= "\n";
+            $packet_lines[] = $packet_line;
+        }
+        foreach($have_refs as $have_ref) {
+            if(Commit::is_null_hash($have_ref)) {
+                continue;
+            }
+            $packet_lines[] = "have {$have_ref}\n";
+        }
+
+        $shallow = $options['shallow'] ?? false;
+        if($shallow) {
+            foreach($want_refs as $want_ref) {
+                // $packet_lines[] = "shallow {$want_ref}\n";
+            }
+            $packet_lines[] = "deepen 1\n";
+        }
+        
+        $packet_lines[] = '0000';
+        $packet_lines[] = "done\n";
+        $packet_lines[] = "done\n";
+
+		$response = $this->http_request(
+			'/git-upload-pack',
+			PacketWriter::encode_packet_lines($packet_lines),
+			array(
+				'Accept: application/x-git-upload-pack-advertisement',
+				'Content-Type: application/x-git-upload-pack-request',
+			)
+		);
+
+        $protocol = new GitProtocolReader(['write_to_repository' => $this->repository]);
+        while($response->next_bytes()) {
+            $protocol->append_bytes($response->get_bytes());
+            while($protocol->next_token()) {
+                // ... Twiddle our thumbs as GitProtocolReader indexes the trees and commits ...
+            }
+        }
+
+        if($response->tell() === 0) {
+            throw new GitException('No objects received');
+        }
+	}
+
+	private function http_request( $path, $postData = null, $headers = array() ) {
+		$remote = $this->repository->get_remote( $this->remote_name );
+		if ( ! $remote ) {
+			throw new GitException( 'Remote "' . $this->remote_name . '" not found' );
+		}
+		$url = $remote['url'] . $path;
+
+		$request_info = array(
+            'headers' => $headers,
+        );
+		if ( $postData ) {
+			$request_info['method']      = 'POST';
+			$request_info['body_stream'] = new MemoryPipe( $postData );
+		}
+		$request = new Request( $url, $request_info );
+		return $this->http_client->fetch( $request );
+	}
+
+}
