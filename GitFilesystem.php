@@ -2,100 +2,100 @@
 
 namespace WordPress\Git;
 
-use WordPress\Filesystem\FilesystemException;
-use WordPress\ByteStream\Reader\ByteReader;
-use WordPress\ByteStream\Writer\ByteWriter;
-use WordPress\ByteStream\MemoryPipe;
-use WordPress\ByteStream\Reader\ReaderUtils;
+use WordPress\ByteStream\ReadStream\ByteReadStream;
 use WordPress\Filesystem\Filesystem;
+use WordPress\Filesystem\FilesystemException;
 use WordPress\Filesystem\Layer\ChrootLayer;
+use WordPress\Filesystem\Mixin\BufferedWriteStreamViaPutContents;
 use WordPress\Filesystem\Mixin\CopyRecursiveViaStreaming;
-use WordPress\Filesystem\Mixin\PutContentsViaWriteStream;
 use WordPress\Filesystem\Mixin\RenameFileViaCopyAndRm;
 
 class GitFilesystem implements Filesystem {
 
-    use CopyRecursiveViaStreaming,
-        RenameFileViaCopyAndRm,
-        PutContentsViaWriteStream;
+	use CopyRecursiveViaStreaming;
+	use RenameFileViaCopyAndRm;
+	use BufferedWriteStreamViaPutContents;
 
 	/**
 	 * @var GitRepository
 	 */
 	private $repo;
 	private $auto_push;
+	/**
+	 * @var GitRemote
+	 */
 	private $remote;
 	private $write_stream;
 
-    static public function create(GitRepository $repo, $options = []) {
-        return new ChrootLayer(
-            new GitFilesystem($repo, $options),
-            $options['root'] ?? '/'
-        );
-    }
+	public static function create( GitRepository $repo, $options = array() ) {
+		return new ChrootLayer(
+			new GitFilesystem( $repo, $options ),
+			$options['root'] ?? '/'
+		);
+	}
 
-    /**
-     * @internal Use the static create() method instead.
-     */
+	/**
+	 * @internal Use the static create() method instead.
+	 */
 	private function __construct(
 		GitRepository $repo,
 		$options = array()
 	) {
 		$this->repo      = $repo;
 		$this->auto_push = $options['auto_push'] ?? false;
-        if($this->auto_push) {
-            $this->remote    = $options['remote'] ?? null;
-            if(!$this->remote) {
-                throw new FilesystemException('GitRemote remote is required when auto_push is enabled');
-            }
-        }
+		if ( $this->auto_push ) {
+			$this->remote = $options['remote'] ?? null;
+			if ( ! $this->remote ) {
+				throw new FilesystemException( 'GitRemote remote is required when auto_push is enabled' );
+			}
+		}
 	}
 
-    public function get_repository(): GitRepository {
-        return $this->repo;
-    }
-
-	public function ls($path = '/') {
-        try {
-            return array_keys(
-                $this->repo->read_object_by_path($path)->as_tree()->entries
-            );
-        } catch (GitException $e) {
-            return [];
-        }
+	public function get_repository(): GitRepository {
+		return $this->repo;
 	}
 
-	public function is_dir($path) {
-        try {
-            $reader = $this->repo->read_object_by_path( $path );
-            return $reader->get_object_type_name() === 'tree';
-        } catch (GitException $e) {
-            return false;
-        }
+	public function ls( $path = '/' ) {
+		try {
+			return array_keys(
+				$this->repo->read_object_by_path( $path )->as_tree()->entries
+			);
+		} catch ( GitException $e ) {
+			return array();
+		}
 	}
 
-	public function is_file($path) {
+	public function is_dir( $path ) {
 		try {
 			$reader = $this->repo->read_object_by_path( $path );
-			return $reader->get_object_type_name() === 'blob';
-		} catch (GitException $e) {
+			return $reader->get_object_type_name() === 'tree';
+		} catch ( GitException $e ) {
 			return false;
 		}
 	}
 
-	public function exists($path) {
+	public function is_file( $path ) {
+		try {
+			$reader = $this->repo->read_object_by_path( $path );
+			return $reader->get_object_type_name() === 'blob';
+		} catch ( GitException $e ) {
+			return false;
+		}
+	}
+
+	public function exists( $path ) {
 		return $this->is_file( $path ) || $this->is_dir( $path );
 	}
 
-    public function get_contents($path) {
-        return ReaderUtils::read_all_remaining_bytes($this->open_read_stream($path));
-    }
-
-	public function open_read_stream($path): ByteReader {
-        return $this->repo->read_object_by_path($path);
+	public function get_contents( $path ) {
+		return $this->open_read_stream( $path )->consume_all();
 	}
 
-	public function mkdir($path, $options = []) {
+	public function open_read_stream( $path ): ByteReadStream {
+		return $this->repo->read_object_by_path( $path );
+	}
+
+	public function mkdir( $path, $options = array() ) {
 		// Git doesn't support empty directories so we must create an empty file.
 		return $this->commit(
 			array(
@@ -106,7 +106,7 @@ class GitFilesystem implements Filesystem {
 		);
 	}
 
-	public function rm($path) {
+	public function rm( $path ) {
 		if ( $this->is_dir( $path ) ) {
 			return false;
 		}
@@ -119,7 +119,7 @@ class GitFilesystem implements Filesystem {
 		);
 	}
 
-	public function rmdir($path, $options = []) {
+	public function rmdir( $path, $options = array() ) {
 		if ( ! $this->is_dir( $path ) ) {
 			return false;
 		}
@@ -138,26 +138,22 @@ class GitFilesystem implements Filesystem {
 		);
 	}
 
-	public function open_write_stream($path): ByteWriter {
+	public function put_contents( $path, $contents, $options = array() ) {
 		if ( $this->write_stream ) {
-			throw new FilesystemException('Cannot open a new write stream while another write stream is open.');
+			throw new FilesystemException( 'Cannot open a new write stream while another write stream is open.' );
 		}
-		$temp_file = tempnam( sys_get_temp_dir(), 'git_write_stream' );
-		if ( false === $temp_file ) {
-			throw new FilesystemException('Failed to create temporary file');
-		}
-		$this->write_stream = array(
-			'repo_path' => $path,
-			'local_path' => $temp_file,
-			'fp' => fopen( $temp_file, 'wb' ),
+		$this->commit(
+			array(
+				'updates' => array(
+					$path => $contents,
+				),
+			)
 		);
-		return new MemoryPipe();
 	}
 
 	private function commit( $options ) {
-		if ( false === $this->repo->commit( $options ) ) {
-			return false;
-		}
+		$this->repo->commit( $options );
+
 		/**
 		 * Auto push if enabled
 		 *
@@ -169,23 +165,15 @@ class GitFilesystem implements Filesystem {
 		 * Let's re-work this once the notes management prototype is more mature.
 		 */
 		if ( $this->auto_push ) {
-			if ( $this->remote->force_push_one_commit() ) {
-				return true;
-			}
+			try {
+				$this->remote->force_push_one_commit();
+			} catch ( GitException $e ) {
+				// If push failed, force pull and retry
+				$this->remote->force_pull();
 
-			// If push failed, force pull and retry
-			if ( false === $this->remote->force_pull() ) {
-				// If this failed, we're out of luck
-				return false;
-			}
-
-			// If pull succeeded, try committing and pushing again
-			if ( false === $this->repo->commit( $options ) ) {
-				return false;
-			}
-
-			if ( false === $this->remote->force_push_one_commit() ) {
-				return false;
+				// If pull succeeded, try committing and pushing again
+				$this->repo->commit( $options );
+				$this->remote->force_push_one_commit();
 			}
 		}
 		return true;

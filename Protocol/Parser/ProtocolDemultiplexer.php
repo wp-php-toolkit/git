@@ -3,143 +3,125 @@
 namespace WordPress\Git\Protocol\Parser;
 
 use WordPress\ByteStream\NotEnoughDataException;
+use WordPress\ByteStream\ReadStream\ByteReadStream;
 use WordPress\Git\GitException;
 
 class ProtocolDemultiplexer {
 
-    protected $bytes = '';
-    protected $bytes_read_so_far = 0;
-    protected $bytes_already_forgotten = 0;
-    protected $is_paused_at_incomplete_input = false;
-    protected $expecting_more_input = true;
-    protected $seen_pack_start = false;
+	const STREAM_CODE_SIDE_BAND = 'side_band';
+	const STREAM_CODE_PROGRESS  = 'progress';
+	const STREAM_CODE_FATAL     = 'fatal';
+	const STREAM_CODE_UNKNOWN   = 'unknown';
 
-    protected $chunk;
-    protected $stream_code;
+	const STREAM_CODE_MAP = array(
+		0x01 => self::STREAM_CODE_SIDE_BAND,
+		0x02 => self::STREAM_CODE_PROGRESS,
+		0x03 => self::STREAM_CODE_FATAL,
+	);
 
-    public function next_chunk() {
-        try {
-            while(true) {
-                if($this->is_paused_at_incomplete_input) {
-                    return false;
-                }
+	/**
+	 * @var ByteReadStream
+	 */
+	protected $upstream                      = '';
+	protected $is_paused_at_incomplete_input = false;
 
-                if($this->is_finished()) {
-                    return false;
-                }
+	protected $chunk;
+	protected $stream_code;
+	protected $seen_unmultiplexed_pack = false;
 
-                $this->parse_chunk();
-                return true;
-            }
-        } catch(NotEnoughDataException $e) {
-            if(!$this->expecting_more_input) {
-                throw $e;
-            }
-            $this->is_paused_at_incomplete_input = true;
-            return false;
-        }
-    }
+	public function __construct( ByteReadStream $upstream ) {
+		$this->upstream = $upstream;
+	}
 
-    private function parse_chunk() {
-        $at = $this->bytes_read_so_far;
-        if($at + 4 >= strlen($this->bytes)) {
-            throw new NotEnoughDataException();
-        }
+	public function next_chunk() {
+		$this->is_paused_at_incomplete_input = false;
+		if ( $this->is_finished() ) {
+			return false;
+		}
 
-        $length_hex = substr($this->bytes, $at, 4);
-        $length = hexdec($length_hex);
-        $at += 4;
+		$this->parse_chunk();
+		return true;
+	}
 
-        $stream_code = 'unknown';
-        if($at + 1 < strlen($this->bytes)) {
-            $potential_stream_code = ord($this->bytes[$at]);
-            if(isset(self::STREAM_CODE_MAP[$potential_stream_code])) {
-                $stream_code = self::STREAM_CODE_MAP[$potential_stream_code];
-                // Skip past the stream_code byte
-                $at += 1;
-                $length -= 1;
-            }
-        }
+	private function parse_chunk() {
+		$this->chunk       = '';
+		$this->stream_code = 'unknown';
 
-        $this->stream_code = $stream_code;
-        if($length_hex === '0000' || $length_hex === '0001' || $length_hex === '0002') {
-            // Yield everything we've parsed to the consumer.
-            $this->chunk = $length_hex;
-            $this->bytes_read_so_far = $at;
-            return;
-        }
+		$this->upstream->pull( 4, ByteReadStream::PULL_EXACTLY );
+		$length_hex = $this->upstream->consume( 4 );
+		if ( $length_hex === 'PACK' ) {
+			$this->seen_unmultiplexed_pack = true;
+		}
+		/**
+		 * If we found an unmultiplexed packfile packet, let's assume it continues
+		 * until the end of the stream.
+		 */
+		if ( $this->seen_unmultiplexed_pack ) {
+			$available = $this->upstream->pull( 1024 );
+			if ( $available > 0 ) {
+				$this->chunk = $length_hex . $this->upstream->consume( $available );
+				return;
+			} else {
+				if ( $length_hex !== '0000' ) {
+					throw new NotEnoughDataException( 'Could not read PACK packet at ' . $this->upstream->tell() );
+				}
+				$this->seen_unmultiplexed_pack = false;
+			}
+		}
 
-        if(0 === $length) {
-            throw new GitException('Demultiplexer error: Received a zero-length chunk ' . $length_hex . ' at ' . $this->get_offset_in_stream());
-        }
-        $length -= 4;
+		$length = hexdec( $length_hex );
 
-        // Buffer the multiplexed chunk
-        if($at + $length >= strlen($this->bytes)) {
-            throw new NotEnoughDataException();
-        }
+		$stream_code = 'unknown';
+		// Peek the next byte to determine the stream code.
+		$this->upstream->pull( 1, ByteReadStream::PULL_EXACTLY );
+		$stream_code_byte      = $this->upstream->peek( 1 );
+		$potential_stream_code = ord( $stream_code_byte );
+		if ( isset( self::STREAM_CODE_MAP[ $potential_stream_code ] ) ) {
+			$stream_code = self::STREAM_CODE_MAP[ $potential_stream_code ];
+			// Skip over the stream code byte.
+			$this->upstream->consume( 1 );
+			$length -= 1;
+		}
 
-        // Yield everything we've parsed to the consumer.
-        $this->stream_code = $stream_code;
-        $chunk = substr($this->bytes, $at, $length);
-        if('unknown' === $stream_code) {
-            // $chunk is not actually multiplexed so we need to relay
-            // both the length hex and the chunk to the consumer.
-            $this->chunk = $length_hex . $chunk;
-        } else {
-            // $chunk is multiplexed and the downstream consumer
-            // only expects the wrapped data.
-            $this->chunk = $chunk;
-        }
-        $this->bytes_already_forgotten += $at + $length - $this->bytes_read_so_far;
-        $this->bytes_read_so_far = $at + $length;
-    }
+		if ( $length_hex === '0000' || $length_hex === '0001' || $length_hex === '0002' ) {
+			$this->chunk       = $length_hex;
+			$this->stream_code = $stream_code;
+			return;
+		}
 
-    private function get_offset_in_stream() {
-        return $this->bytes_already_forgotten + $this->bytes_read_so_far;
-    }
+		if ( 0 === $length ) {
+			throw new GitException( 'Demultiplexer error: Received a zero-length chunk ' . $length_hex . ' at ' . $this->upstream->tell() );
+		}
 
-    public function append_bytes($bytes) {
-        $this->bytes .= $bytes;
-        $this->bytes = substr($this->bytes, $this->bytes_read_so_far);
-        $this->bytes_read_so_far = 0;
-        $this->is_paused_at_incomplete_input = false;
-    }
+		// Buffer the multiplexed chunk and yield it to the consumer.
+		$length -= 4;
+		$this->upstream->pull( $length, ByteReadStream::PULL_EXACTLY );
+		$chunk             = $this->upstream->consume( $length );
+		$this->stream_code = $stream_code;
+		if ( 'unknown' === $this->stream_code ) {
+			// $chunk is not actually multiplexed so we need to relay
+			// all the data we've read so far to the consumer.
+			$this->chunk = $length_hex . $chunk;
+		} else {
+			// $chunk is multiplexed and the downstream consumer
+			// only expects the wrapped data.
+			$this->chunk = $chunk;
+		}
+	}
 
-    public function get_stream_code() {
-        return $this->stream_code;
-    }
+	public function get_stream_code() {
+		return $this->stream_code;
+	}
 
-    public function get_chunk() {
-        return $this->chunk;
-    }
+	public function get_chunk() {
+		return $this->chunk;
+	}
 
 	public function is_paused_at_incomplete_input(): bool {
 		return $this->is_paused_at_incomplete_input;
 	}
 
-    public function is_finished(): bool {
-        return !$this->expecting_more_input || strlen($this->bytes) === 0;
-    }
-
-	/**
-	 * Indicates that all the multiplexed bytes have been provided.
-	 *
-	 * After calling this method, the processor will emit errors where
-	 * previously it would have entered the STATE_INCOMPLETE_INPUT state.
-	 */
-	public function input_finished() {
-		$this->expecting_more_input = false;
+	public function is_finished(): bool {
+		return $this->upstream->reached_end_of_data();
 	}
-
-    const STREAM_CODE_SIDE_BAND = 'side_band';
-    const STREAM_CODE_PROGRESS = 'progress';
-    const STREAM_CODE_FATAL = 'fatal';
-    const STREAM_CODE_UNKNOWN = 'unknown';
-
-    const STREAM_CODE_MAP = [
-        0x01 => self::STREAM_CODE_SIDE_BAND,
-        0x02 => self::STREAM_CODE_PROGRESS,
-        0x03 => self::STREAM_CODE_FATAL,
-    ];
 }
