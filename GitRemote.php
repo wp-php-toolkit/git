@@ -333,14 +333,13 @@ class GitRemote {
 					$remote_head,
 					array( 'path' => $options['path'] )
 				);
-				$this->git_upload_pack(
-					array(
-						'shallow'   => array( $remote_head ),
-						'deepen'    => 1,
-						'want_refs' => array( $remote_head, ...$missing_oids ),
-						'have_refs' => array( $last_fetched_head_ref ),
-					)
-				)->consume_stream();
+				if(count($missing_oids) > 0) {
+					$this->git_upload_pack(
+						array(
+							'want_refs' => $missing_oids,
+						)
+					)->consume_stream();
+				}
 			} else {
 				$this->git_upload_pack(
 					array(
@@ -356,14 +355,16 @@ class GitRemote {
 			// Make double sure we have all the relevant objects from the remote commit.
 			// @TODO: investigate why sometimes the root tree is missing and address the
 			// root cause instead of plugging the hole with a bandaid.
-			if ( ! $this->repository->has_all_objects_from_commit( $remote_head ) ) {
-				$this->git_upload_pack(
-					array(
-						'want_refs' => array( $remote_head ),
-						'shallow'   => array( $remote_head ),
-						'deepen'    => 1,
-					)
-				)->consume_stream();
+			if ( !isset($options['path']) || $options['path'] === '/' || $options['path'] === '' ) {
+				if ( ! $this->repository->has_all_objects_from_commit( $remote_head ) ) {
+					$this->git_upload_pack(
+						array(
+							'want_refs' => array( $remote_head ),
+							'shallow'   => array( $remote_head ),
+							'deepen'    => 1,
+						)
+					)->consume_stream();
+				}
 			}
 		}
 	}
@@ -448,7 +449,7 @@ class GitRemote {
 		for ( $i = 0; $i < count( $want_refs ); $i++ ) {
 			$packet_line = "want {$want_refs[$i]}";
 			if ( $i === 0 ) {
-				$packet_line .= ' multi_ack_detailed no-done side-band-64k ofs-delta agent=git/2.37.3 filter push-options';
+				$packet_line .= ' multi_ack_detailed no-done side-band-64k ofs-delta thin-pack agent=git/2.37.3 filter';
 			}
 			$packet_line   .= "\n";
 			$packet_lines[] = $packet_line;
@@ -484,7 +485,6 @@ class GitRemote {
 		}
 		$packet_lines[] = '0000';
 		$packet_lines[] = "done\n";
-
 		$response_stream = $this->http_request(
 			'/git-upload-pack',
 			GitProtocolEncoderPipe::encode_packet_lines( $packet_lines ),
